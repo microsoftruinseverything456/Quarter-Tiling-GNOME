@@ -1,0 +1,11 @@
+{
+  "uuid": "quarter-tiling@llama",
+  "name": "Quarter Tiling",
+  "description": "Turn half-tiled windows into quarter-tiled windows, with GNOME's tiling animation.\n\n* Super+Up on a left/right half moves the window to the top quarter of that side.\n* Super+Down on a left/right half moves the window to the bottom quarter of that side.\n* Super+Down on a top quarter moves it to the bottom corner; Super+Up on a bottom quarter moves it to the top corner.\n* Super+Up on a top quarter maximizes the window.\n\nAll other windows keep GNOME's normal Super+Up / Super+Down behaviour.",
+  "shell-version": [
+    "48",
+    "49",
+    "50",
+    "51"
+  ]
+}
