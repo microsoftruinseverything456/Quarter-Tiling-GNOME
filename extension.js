@@ -7,6 +7,7 @@ import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {WINDOW_ANIMATION_TIME} from 'resource:///org/gnome/shell/ui/windowManager.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 // Built-in mutter keybindings we take over (Super+Up / Super+Down by default).
@@ -16,8 +17,6 @@ const UNMAXIMIZE_BINDING = 'unmaximize';
 // Size-hinted windows (terminals, etc.) rarely fill a tile exactly.
 const TOLERANCE_PX = 32;
 
-const WINDOW_ANIMATION_TIME = 250;
-
 // Give up waiting for a slow client to reach the new geometry after this.
 const ANIMATION_WAIT_MS = 1000;
 
@@ -25,24 +24,7 @@ const Side = {LEFT: 'left', RIGHT: 'right'};
 const Slot = {HALF: 'half', TOP: 'top', BOTTOM: 'bottom'};
 
 function isMaximizedAtAll(window) {
-    if (window.get_maximize_flags)
-        return window.get_maximize_flags() !== Meta.MaximizeFlags.NONE;
-    return window.get_maximized() !== Meta.MaximizeFlags.NONE;
-}
-
-// GNOME 48 takes MaximizeFlags; GNOME 49+ takes no argument.
-function maximize(window) {
-    if (window.get_maximize_flags)
-        window.maximize();
-    else
-        window.maximize(Meta.MaximizeFlags.BOTH);
-}
-
-function unmaximize(window) {
-    if (window.get_maximize_flags)
-        window.unmaximize();
-    else
-        window.unmaximize(Meta.MaximizeFlags.BOTH);
+    return window.get_maximize_flags() !== Meta.MaximizeFlags.NONE;
 }
 
 function near(a, b) {
@@ -105,7 +87,7 @@ function canTile(window) {
 export default class QuarterTilingExtension extends Extension {
     enable() {
         this._animations = new Map();
-        this._settleSources = new Set();
+        this._settleSources = new Map();
 
         Main.wm.setCustomKeybindingHandler(MAXIMIZE_BINDING,
             Shell.ActionMode.NORMAL,
@@ -119,13 +101,15 @@ export default class QuarterTilingExtension extends Extension {
         // A null handler restores mutter's default behaviour.
         Meta.keybindings_set_custom_handler(MAXIMIZE_BINDING, null);
         Meta.keybindings_set_custom_handler(UNMAXIMIZE_BINDING, null);
+        Main.wm.allowKeybinding(MAXIMIZE_BINDING, Shell.ActionMode.NONE);
+        Main.wm.allowKeybinding(UNMAXIMIZE_BINDING, Shell.ActionMode.NONE);
 
         for (const window of [...this._animations.keys()])
             this._finishAnimation(window);
         this._animations = null;
 
-        for (const sourceId of this._settleSources)
-            GLib.source_remove(sourceId);
+        for (const window of [...this._settleSources.keys()])
+            this._cancelSettle(window);
         this._settleSources = null;
     }
 
@@ -141,7 +125,7 @@ export default class QuarterTilingExtension extends Extension {
 
         // Default Super+Up (also used for a top quarter).
         if (window.can_maximize())
-            maximize(window);
+            window.maximize();
     }
 
     _onSuperDown(window) {
@@ -158,7 +142,7 @@ export default class QuarterTilingExtension extends Extension {
 
         // Default Super+Down.
         if (isMaximizedAtAll(window))
-            unmaximize(window);
+            window.unmaximize();
     }
 
     _moveToTile(window, workArea, side, slot) {
@@ -177,25 +161,38 @@ export default class QuarterTilingExtension extends Extension {
         if (isMaximizedAtAll(window)) {
             if (actor)
                 Main.wm.skipNextEffect(actor);
-            unmaximize(window);
+            window.unmaximize();
         }
 
         window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
+        this._settleGeometry(window, rect);
+    }
 
-        // Unmaximizing can queue its own restore geometry; reapply once it settles.
+    // Unmaximizing can queue its own restore geometry; reapply once it settles.
+    _settleGeometry(window, rect) {
+        this._cancelSettle(window);
+
         const sourceId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            this._settleSources.delete(sourceId);
-            try {
-                if (!rectsEqual(window.get_frame_rect(), rect)) {
-                    window.move_resize_frame(true, rect.x, rect.y,
-                        rect.width, rect.height);
-                }
-            } catch {
-                // Window was destroyed in the meantime.
+            this._settleSources.delete(window);
+            window.disconnectObject(this);
+            if (!rectsEqual(window.get_frame_rect(), rect)) {
+                window.move_resize_frame(true, rect.x, rect.y,
+                    rect.width, rect.height);
             }
             return GLib.SOURCE_REMOVE;
         });
-        this._settleSources.add(sourceId);
+        this._settleSources.set(window, sourceId);
+        window.connectObject('unmanaging', () => this._cancelSettle(window), this);
+    }
+
+    _cancelSettle(window) {
+        const sourceId = this._settleSources.get(window);
+        if (sourceId === undefined)
+            return;
+        this._settleSources.delete(window);
+
+        GLib.source_remove(sourceId);
+        window.disconnectObject(this);
     }
 
     // Mirrors GNOME Shell's own maximize/tile animation: freeze the window at
@@ -258,8 +255,7 @@ export default class QuarterTilingExtension extends Extension {
         window.disconnectObject(clone);
 
         const {reducedMotion} = St.Settings.get();
-        const useMotion = !St.ReducedMotion ||
-            reducedMotion !== St.ReducedMotion.REDUCE;
+        const useMotion = reducedMotion !== St.ReducedMotion.REDUCE;
         const targetRect = useMotion ? window.get_frame_rect() : oldRect;
         const scaleX = targetRect.width / oldRect.width;
         const scaleY = targetRect.height / oldRect.height;
