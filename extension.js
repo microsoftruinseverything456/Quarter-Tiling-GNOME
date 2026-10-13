@@ -146,6 +146,7 @@ export default class QuarterTilingExtension extends Extension {
         this._snapLaterId = 0;
         this._drag = null;
         this._shellPreview = null;
+        this._sideTileWatch = {};
 
         Main.wm.setCustomKeybindingHandler(MAXIMIZE_BINDING,
             Shell.ActionMode.NORMAL,
@@ -157,26 +158,30 @@ export default class QuarterTilingExtension extends Extension {
         global.display.connectObject(
             'grab-op-begin', (_display, window, op) => this._onGrabBegin(window, op),
             'grab-op-end', (_display, window) => this._onGrabEnd(window),
+            'window-created', (_display, window) => this._watchSideTiling(window),
             this);
+        for (const window of global.display.list_all_windows())
+            this._watchSideTiling(window);
 
         // Share the shell's tile preview so moving between a half and a corner
         // animates like GNOME's own previews. Mutter re-requests its preview
         // every 200ms while the pointer moves at an edge; remember those
         // requests, but ignore them while a corner preview owns the highlight.
-        Main.wm._tilePreview ??= new TilePreview();
-        this._tilePreview = Main.wm._tilePreview;
+        this._ownPreviewCall = false;
         this._injections = new InjectionManager();
         const extension = this;
-        this._injections.overrideMethod(this._tilePreview, 'open',
+        this._injections.overrideMethod(TilePreview.prototype, 'open',
             original => function (window, rect, monitor) {
-                extension._shellPreview = {window, rect, monitor};
-                if (!extension._drag?.corner)
+                if (!extension._ownPreviewCall)
+                    extension._shellPreview = {window, rect, monitor};
+                if (extension._ownPreviewCall || !extension._drag?.corner)
                     original.call(this, window, rect, monitor);
             });
-        this._injections.overrideMethod(this._tilePreview, 'close',
+        this._injections.overrideMethod(TilePreview.prototype, 'close',
             original => function () {
-                extension._shellPreview = null;
-                if (!extension._drag?.corner)
+                if (!extension._ownPreviewCall)
+                    extension._shellPreview = null;
+                if (extension._ownPreviewCall || !extension._drag?.corner)
                     original.call(this);
             });
     }
@@ -189,6 +194,9 @@ export default class QuarterTilingExtension extends Extension {
         Main.wm.allowKeybinding(UNMAXIMIZE_BINDING, Shell.ActionMode.NONE);
 
         global.display.disconnectObject(this);
+        for (const window of global.display.list_all_windows())
+            window.disconnectObject(this._sideTileWatch);
+        this._sideTileWatch = null;
         if (this._drag?.corner)
             this._closePreview();
         this._stopDrag();
@@ -196,7 +204,6 @@ export default class QuarterTilingExtension extends Extension {
 
         this._injections.clear();
         this._injections = null;
-        this._tilePreview = null;
 
         for (const window of [...this._animations.keys()])
             this._finishAnimation(window);
@@ -254,6 +261,10 @@ export default class QuarterTilingExtension extends Extension {
         if (actor && !rectsEqual(fromRect, rect))
             this._prepareAnimation(window, actor, fromRect, rect);
 
+        this._applyTile(window, actor, rect);
+    }
+
+    _applyTile(window, actor, rect) {
         // Natively tiled windows are maximized vertically; mutter's constraints
         // would snap them back unless we release that state first. Our own
         // animation covers the change, so skip the shell's unmaximize effect.
@@ -265,6 +276,48 @@ export default class QuarterTilingExtension extends Extension {
 
         window.move_resize_frame(true, rect.x, rect.y, rect.width, rect.height);
         this._settleGeometry(window, rect);
+    }
+
+    // Super+Left/Right are mutter's toggle-tiled bindings, which extensions
+    // can't reimplement (tiling isn't exposed), so let mutter half-tile the
+    // window and turn it back into a quarter if it changed sides. Maximize
+    // flags change before mutter announces the size change, which lets us
+    // skip the shell's half-tile animation and play our own instead.
+    _watchSideTiling(window) {
+        window.connectObject('notify::maximized-vertically',
+            () => this._onSideTiled(window), this._sideTileWatch);
+    }
+
+    _onSideTiled(window) {
+        if (!window.maximized_vertically || window.maximized_horizontally)
+            return;
+        if (this._drag?.window === window || !canTile(window))
+            return;
+
+        // The frame still has its old geometry at this point.
+        const tile = detectTile(window);
+        if (!tile || tile.slot === Slot.HALF)
+            return;
+
+        const actor = window.get_compositor_private();
+        if (!actor)
+            return;
+
+        this._finishAnimation(window);
+        Main.wm.skipNextEffect(actor);
+
+        // Which side mutter picked is only known once the window reaches it.
+        this._prepareAnimation(window, actor, window.get_frame_rect(), frame => {
+            const half = detectTile(window);
+            if (half?.slot !== Slot.HALF)
+                return null;
+            if (half.side === tile.side)
+                return frame;
+
+            const rect = tileRect(half.workArea, half.side, tile.slot);
+            this._applyTile(window, actor, rect);
+            return rect;
+        });
     }
 
     _onGrabBegin(window, op) {
@@ -373,25 +426,38 @@ export default class QuarterTilingExtension extends Extension {
             Main.wm._skippedActors.delete(actor);
     }
 
-    // Call the unpatched methods, which the shell's requests can't override.
     _showCornerPreview() {
         const {window, corner} = this._drag;
         const rect = new Mtk.Rectangle(
             tileRect(corner.workArea, corner.side, corner.slot));
-        TilePreview.prototype.open.call(this._tilePreview, window, rect,
-            corner.monitor);
+        this._openPreview(window, rect, corner.monitor);
+    }
+
+    // Go through the shell, which creates its preview on first use; the flag
+    // lets these calls past the overrides that hold back mutter's requests.
+    _openPreview(window, rect, monitor) {
+        this._ownPreviewCall = true;
+        try {
+            Main.wm._showTilePreview(global.window_manager, window, rect, monitor);
+        } finally {
+            this._ownPreviewCall = false;
+        }
     }
 
     _closePreview() {
-        TilePreview.prototype.close.call(this._tilePreview);
+        this._ownPreviewCall = true;
+        try {
+            Main.wm._hideTilePreview();
+        } finally {
+            this._ownPreviewCall = false;
+        }
     }
 
     // Put back whatever mutter's own edge-tiling preview should be showing.
     _restoreShellPreview() {
         const preview = this._shellPreview;
         if (preview && this._drag?.window === preview.window) {
-            TilePreview.prototype.open.call(this._tilePreview, preview.window,
-                preview.rect, preview.monitor);
+            this._openPreview(preview.window, preview.rect, preview.monitor);
         } else {
             this._closePreview();
         }
@@ -451,6 +517,8 @@ export default class QuarterTilingExtension extends Extension {
     // Mirrors GNOME Shell's own maximize/tile animation: freeze the window at
     // its old geometry with a snapshot on top, then once the client has resized,
     // scale the window from the old rect to the new one while the snapshot fades.
+    // targetRect may instead be a function that is given each new frame rect
+    // and returns the target once it can tell, or null to keep waiting.
     _prepareAnimation(window, actor, oldRect, targetRect) {
         if (oldRect.width <= 0 || oldRect.height <= 0)
             return;
@@ -473,6 +541,13 @@ export default class QuarterTilingExtension extends Extension {
         this._animations.set(window, animation);
 
         const onGeometryChanged = () => {
+            const frame = window.get_frame_rect();
+            if (typeof targetRect === 'function') {
+                const rect = targetRect(frame);
+                if (!rect)
+                    return;
+                targetRect = rect;
+            }
             if (rectsNear(window.get_frame_rect(), targetRect))
                 this._startAnimation(window);
         };
